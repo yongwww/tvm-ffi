@@ -69,10 +69,19 @@ jobs:
       # For pull_request_target, checkout the PR's actual code
       checkout-ref: ${{ github.event.pull_request.head.sha || github.sha }}
       volume-size: 150
+      docker-image: "nvidia/cuda:12.2.0-devel-ubuntu22.04"
+      docker-flags: "--gpus all"
       test-script: |
         set -eux
-        # Verify GPU is available
         nvidia-smi
+
+        # Install build tools inside the container
+        apt-get update && apt-get install -y cmake g++ python3 python3-pip python3-venv git
+
+        # Initialize git submodules (needed for 3rdparty)
+        git config --global --add safe.directory '*'
+        cd /home/jenkins/workspace
+        git submodule update --init --recursive || true
 
         # Build C++ tests
         cmake . -B build -DTVM_FFI_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
@@ -80,7 +89,7 @@ jobs:
         ctest -V -C Release --test-dir build --output-on-failure
 
         # Build and run Python tests
-        pip3 install -e ".[test]" 2>/dev/null || pip install -e ".[test]"
+        pip3 install -e ".[test]" --break-system-packages 2>/dev/null || pip3 install -e ".[test]"
         python3 -m pytest tests/python -vvs --timeout=600
       artifacts-path: ""
       artifacts-name: "gpu-test-results"
