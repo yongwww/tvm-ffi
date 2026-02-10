@@ -99,6 +99,11 @@ on:
         type: string
         default: "ubuntu"
         description: "SSH username on the EC2 instance (ubuntu for standard AMIs, jenkins for Jenkins AMIs)"
+      checkout-ref:
+        required: false
+        type: string
+        default: ""
+        description: "Git ref to checkout (for pull_request_target, pass the PR head SHA)"
 
 jobs:
   run:
@@ -113,6 +118,8 @@ jobs:
         if: inputs.upload-code
         uses: actions/checkout@v5
         with:
+          # For pull_request_target, checkout the PR's code (not base branch)
+          ref: ${{ inputs.checkout-ref || github.sha }}
           submodules: recursive
           fetch-depth: 1
 
@@ -264,7 +271,7 @@ jobs:
             /tmp/repo.tar.gz "$SSH_USER@$IP":/tmp/repo.tar.gz
 
           ssh $SSH_OPTS -i /tmp/ci-key.pem "$SSH_USER@$IP" \
-            "sudo mkdir -p /workspace && sudo chown $SSH_USER /workspace && tar xzf /tmp/repo.tar.gz -C /workspace"
+            "mkdir -p /home/$SSH_USER/workspace && tar xzf /tmp/repo.tar.gz -C /home/$SSH_USER/workspace"
 
           echo "::endgroup::"
           echo "✅ Code uploaded"
@@ -274,14 +281,16 @@ jobs:
         run: |
           IP="${{ steps.ec2.outputs.ip }}"
 
+          WORKSPACE="/home/$SSH_USER/workspace"
+
           # Build the command: either inside Docker or directly
           if [ -n "${{ inputs.docker-image }}" ]; then
             REMOTE_CMD="docker run --rm ${{ inputs.docker-flags }} \
-              -v /workspace:/workspace -w /workspace \
+              -v $WORKSPACE:$WORKSPACE -w $WORKSPACE \
               ${{ inputs.docker-image }} \
               bash -c '${{ inputs.test-script }}'"
           else
-            REMOTE_CMD="cd /workspace && ${{ inputs.test-script }}"
+            REMOTE_CMD="cd $WORKSPACE && ${{ inputs.test-script }}"
           fi
 
           echo "::group::Running on remote (${{ inputs.instance-type }})..."

@@ -28,7 +28,8 @@ name: GPU CI
 
 on:
   workflow_dispatch:
-  pull_request:
+  # pull_request_target: secrets work for fork PRs, workflow YAML always from main
+  pull_request_target:
     branches:
       - main
       - dev
@@ -47,20 +48,31 @@ jobs:
   # Subnets: frontend (public) us-west-2a/b/c
   # Security groups: ssh_inbound + egress (same as Jenkins agents)
   # AMI: jenkins-gpu-agent-x64 (Ubuntu 20.04 + NVIDIA + Docker)
+  #
+  # Security: pull_request_target ensures the workflow YAML is always from main.
+  # Fork code only runs on the ephemeral EC2 instance (no secrets there).
+  # Approval gate: only runs for trusted authors or maintainer-approved PRs.
   gpu-test:
+    if: >
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.author_association == 'MEMBER' ||
+      github.event.pull_request.author_association == 'COLLABORATOR' ||
+      github.event.pull_request.author_association == 'OWNER' ||
+      contains(github.event.pull_request.labels.*.name, 'ci-approved')
     uses: ./.github/workflows/run-on-ec2.yml
     with:
       job-name: "GPU Test (T4)"
       instance-type: g4dn.xlarge
       ami: ${{ vars.GPU_AMI_X64 }}
       ssh-user: ${{ vars.EC2_SSH_USER || 'jenkins' }}
+      # For pull_request_target, checkout the PR's actual code
+      checkout-ref: ${{ github.event.pull_request.head.sha || github.sha }}
       volume-size: 150
       test-script: |
         set -eux
         # Verify GPU is available
         nvidia-smi
-
-        cd /workspace
 
         # Build C++ tests
         cmake . -B build -DTVM_FFI_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
@@ -70,7 +82,7 @@ jobs:
         # Build and run Python tests
         pip3 install -e ".[test]" 2>/dev/null || pip install -e ".[test]"
         python3 -m pytest tests/python -vvs --timeout=600
-      artifacts-path: "/workspace/build/Testing"
+      artifacts-path: ""
       artifacts-name: "gpu-test-results"
       timeout: 60
     secrets: inherit
