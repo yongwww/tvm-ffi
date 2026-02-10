@@ -131,6 +131,29 @@ jobs:
           echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > /tmp/ci-key.pem
           chmod 600 /tmp/ci-key.pem
 
+      # ── Add temporary SSH rule for this runner's IP ──
+      - name: Allow SSH from this runner
+        id: ssh-rule
+        run: |
+          # Get this runner's public IP
+          RUNNER_IP=$(curl -s https://checkip.amazonaws.com || curl -s https://ifconfig.me)
+          echo "runner-ip=$RUNNER_IP" >> "$GITHUB_OUTPUT"
+          echo "Runner IP: $RUNNER_IP"
+
+          # Pick the first SG from the list to add the rule to
+          SG_IDS="${{ inputs.security-group-ids || vars.EC2_SG_IDS }}"
+          SSH_SG=$(echo "$SG_IDS" | awk '{print $1}')
+          echo "ssh-sg=$SSH_SG" >> "$GITHUB_OUTPUT"
+
+          # Add temporary inbound SSH rule for just this runner's IP
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SSH_SG" \
+            --protocol tcp --port 22 \
+            --cidr "$RUNNER_IP/32" \
+            --tag-specifications "ResourceType=security-group-rule,Tags=[{Key=GH_RUN_ID,Value=${{ github.run_id }}},{Key=Temp,Value=gha-runner}]" \
+            2>/dev/null && echo "✅ Added SSH rule for $RUNNER_IP/32 to $SSH_SG" || \
+            echo "::warning::Could not add SSH rule (may already exist)"
+
       # ── Launch EC2: spot with on-demand fallback ──
       - name: Launch EC2 instance
         id: ec2
@@ -263,7 +286,21 @@ jobs:
           path: /tmp/results/
           if-no-files-found: ignore
 
-      # ── Always terminate ──
+      # ── Always clean up ──
+      - name: Remove temporary SSH rule
+        if: always()
+        run: |
+          RUNNER_IP="${{ steps.ssh-rule.outputs.runner-ip }}"
+          SSH_SG="${{ steps.ssh-rule.outputs.ssh-sg }}"
+          if [ -n "$RUNNER_IP" ] && [ -n "$SSH_SG" ]; then
+            aws ec2 revoke-security-group-ingress \
+              --group-id "$SSH_SG" \
+              --protocol tcp --port 22 \
+              --cidr "$RUNNER_IP/32" \
+              2>/dev/null && echo "✅ Removed SSH rule for $RUNNER_IP/32" || \
+              echo "::warning::Could not remove SSH rule"
+          fi
+
       - name: Terminate EC2 instance
         if: always()
         run: |
