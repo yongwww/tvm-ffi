@@ -1,0 +1,76 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# GPU CI: Runs tests on EC2 spot instances via SSH (Option 6).
+# Uses the same model as Jenkins — GHA orchestrates, EC2 executes.
+#
+# Required repo secrets:
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, EC2_SSH_PRIVATE_KEY
+# Required repo variables:
+#   EC2_SUBNET_ID, EC2_SG_ID, EC2_KEY_NAME
+#   GPU_AMI_X64 (AMI with NVIDIA drivers + Docker)
+
+name: GPU CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+      - dev
+  push:
+    branches:
+      - main
+      - dev
+
+concurrency:
+  group: gpu-ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  # ── GPU Tests (g4dn.xlarge = T4 GPU) ──
+  # Uses the same AWS account / VPC / subnets as Jenkins CI (tlc-pack/ci).
+  # Subnets: frontend (public) us-west-2a/b/c
+  # Security groups: ssh_inbound + egress (same as Jenkins agents)
+  # AMI: jenkins-gpu-agent-x64 (Ubuntu 20.04 + NVIDIA + Docker)
+  gpu-test:
+    uses: ./.github/workflows/run-on-ec2.yml
+    with:
+      job-name: "GPU Test (T4)"
+      instance-type: g4dn.xlarge
+      ami: ${{ vars.GPU_AMI_X64 }}
+      ssh-user: ${{ vars.EC2_SSH_USER || 'jenkins' }}
+      volume-size: 150
+      test-script: |
+        set -eux
+        # Verify GPU is available
+        nvidia-smi
+
+        cd /workspace
+
+        # Build C++ tests
+        cmake . -B build -DTVM_FFI_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+        cmake --build build --config Release --target tvm_ffi_tests -- -j$(nproc)
+        ctest -V -C Release --test-dir build --output-on-failure
+
+        # Build and run Python tests
+        pip3 install -e ".[test]" 2>/dev/null || pip install -e ".[test]"
+        python3 -m pytest tests/python -vvs --timeout=600
+      artifacts-path: "/workspace/build/Testing"
+      artifacts-name: "gpu-test-results"
+      timeout: 60
+    secrets: inherit

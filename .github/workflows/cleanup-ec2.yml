@@ -1,0 +1,81 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Safety net: terminates orphaned EC2 instances that were launched by
+# run-on-ec2.yml but not properly cleaned up (e.g., workflow cancelled,
+# hosted runner died, spot termination during cleanup step).
+#
+# Runs every 30 minutes. Terminates instances tagged with GH_REPO
+# matching this repository that have been running for more than 3 hours.
+
+name: Cleanup Orphaned EC2
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    name: Cleanup orphaned instances
+    runs-on: ubuntu-latest
+    # Update this condition when moving to the apache org
+    if: github.repository == 'apache/tvm-ffi' || github.repository == 'yongwww/tvm-ffi'
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.EC2_AWS_REGION || 'us-west-2' }}
+          role-to-assume: ${{ vars.AWS_ROLE_ARN || '' }}
+          role-duration-seconds: 3600
+
+      - name: Find and terminate orphaned instances
+        run: |
+          set -euo pipefail
+
+          # Calculate cutoff time (3 hours ago)
+          # Works on both GNU date (Linux) and BSD date (macOS)
+          CUTOFF=$(date -u -d '3 hours ago' '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || \
+                   date -u -v-3H '+%Y-%m-%dT%H:%M:%S')
+
+          echo "Looking for instances launched before $CUTOFF tagged with GH_REPO=${{ github.repository }}..."
+
+          # Find running instances tagged by our workflows
+          INSTANCES=$(aws ec2 describe-instances \
+            --filters \
+              "Name=tag:GH_REPO,Values=${{ github.repository }}" \
+              "Name=instance-state-name,Values=running,pending" \
+            --query "Reservations[].Instances[?LaunchTime<='${CUTOFF}'].[InstanceId,LaunchTime,Tags[?Key=='GH_JOB'].Value|[0]]" \
+            --output text)
+
+          if [ -z "$INSTANCES" ] || [ "$INSTANCES" = "None" ]; then
+            echo "✅ No orphaned instances found"
+            exit 0
+          fi
+
+          echo "Found orphaned instances:"
+          echo "$INSTANCES"
+
+          # Extract just the instance IDs (first column)
+          INSTANCE_IDS=$(echo "$INSTANCES" | awk '{print $1}' | tr '\n' ' ')
+
+          echo "Terminating: $INSTANCE_IDS"
+          aws ec2 terminate-instances --instance-ids $INSTANCE_IDS
+
+          echo "✅ Terminated $(echo $INSTANCE_IDS | wc -w) orphaned instance(s)"

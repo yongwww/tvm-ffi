@@ -1,0 +1,270 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Reusable workflow: Launch EC2 spot instance, run commands over SSH, terminate.
+# This is the same model Jenkins uses — orchestrator (GHA) + SSH + EC2 spot.
+# No GitHub App, no admin PAT, no self-hosted runner registration needed.
+#
+# Required repo secrets:
+#   AWS_ACCESS_KEY_ID     - IAM user with EC2 permissions
+#   AWS_SECRET_ACCESS_KEY - IAM secret key
+#   EC2_SSH_PRIVATE_KEY   - SSH private key matching the EC2 key pair
+
+name: Run on EC2
+
+on:
+  workflow_call:
+    inputs:
+      job-name:
+        required: true
+        type: string
+        description: "Display name for this job"
+      instance-type:
+        required: true
+        type: string
+        description: "EC2 instance type (e.g., g4dn.xlarge, c5.4xlarge)"
+      ami:
+        required: true
+        type: string
+        description: "AMI ID for the EC2 instance"
+      test-script:
+        required: true
+        type: string
+        description: "Shell commands to run on the remote instance"
+      docker-image:
+        required: false
+        type: string
+        default: ""
+        description: "Docker image to run test-script inside (leave empty to run directly)"
+      docker-flags:
+        required: false
+        type: string
+        default: ""
+        description: "Extra docker run flags (e.g., --gpus all)"
+      timeout:
+        required: false
+        type: number
+        default: 120
+        description: "Job timeout in minutes"
+      volume-size:
+        required: false
+        type: number
+        default: 100
+        description: "Root EBS volume size in GB"
+      subnet-id:
+        required: false
+        type: string
+        default: ""
+        description: "VPC subnet ID (overrides EC2_SUBNET_ID var)"
+      security-group-ids:
+        required: false
+        type: string
+        default: ""
+        description: "Comma-separated security group IDs (overrides EC2_SG_IDS var)"
+      aws-region:
+        required: false
+        type: string
+        default: "us-west-2"
+      upload-code:
+        required: false
+        type: boolean
+        default: true
+        description: "Whether to upload repo code to the remote instance"
+      artifacts-path:
+        required: false
+        type: string
+        default: ""
+        description: "Path on remote to SCP back as artifacts (e.g., /workspace/results.xml)"
+      artifacts-name:
+        required: false
+        type: string
+        default: ""
+        description: "Name for the uploaded artifact"
+      ssh-user:
+        required: false
+        type: string
+        default: "ubuntu"
+        description: "SSH username on the EC2 instance (ubuntu for standard AMIs, jenkins for Jenkins AMIs)"
+
+jobs:
+  run:
+    name: ${{ inputs.job-name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout }}
+    env:
+      SSH_OPTS: "-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=5"
+      SSH_USER: ${{ inputs.ssh-user }}
+    steps:
+      - name: Checkout code
+        if: inputs.upload-code
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.aws-region }}
+          role-to-assume: ${{ vars.AWS_ROLE_ARN || '' }}
+          role-duration-seconds: 3600
+
+      - name: Write SSH key
+        run: |
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > /tmp/ci-key.pem
+          chmod 600 /tmp/ci-key.pem
+
+      # ── Launch EC2: spot with on-demand fallback ──
+      - name: Launch EC2 instance
+        id: ec2
+        run: |
+          set -euo pipefail
+
+          SUBNET="${{ inputs.subnet-id || vars.EC2_SUBNET_ID }}"
+          SG_IDS="${{ inputs.security-group-ids || vars.EC2_SG_IDS }}"
+          KEY_NAME="${{ vars.EC2_KEY_NAME || 'gha-ci-key' }}"
+
+          launch_instance() {
+            local MARKET_FLAG="${1:-}"
+            aws ec2 run-instances \
+              --image-id "${{ inputs.ami }}" \
+              --instance-type "${{ inputs.instance-type }}" \
+              --key-name "$KEY_NAME" \
+              --security-group-ids $SG_IDS \
+              --subnet-id "$SUBNET" \
+              $MARKET_FLAG \
+              --tag-specifications "ResourceType=instance,Tags=[
+                {Key=Name,Value=gha-${{ inputs.job-name }}-${{ github.run_id }}},
+                {Key=GH_RUN_ID,Value=${{ github.run_id }}},
+                {Key=GH_REPO,Value=${{ github.repository }}},
+                {Key=GH_JOB,Value=${{ inputs.job-name }}}]" \
+              --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":${{ inputs.volume-size }},"VolumeType":"gp3"}}]' \
+              --query 'Instances[0].InstanceId' --output text
+          }
+
+          # Try spot first
+          echo "::group::Requesting spot instance (${{ inputs.instance-type }})..."
+          INSTANCE_ID=$(launch_instance \
+            '--instance-market-options {"MarketType":"spot","SpotOptions":{"SpotInstanceType":"one-time"}}' \
+            2>&1) || {
+            echo "::warning::Spot request failed: $INSTANCE_ID"
+            echo "Falling back to on-demand..."
+            INSTANCE_ID=$(launch_instance)
+          }
+          echo "::endgroup::"
+
+          echo "instance-id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "✅ Launched instance: $INSTANCE_ID"
+
+          # Wait for running state
+          echo "::group::Waiting for instance to be running..."
+          aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+          echo "::endgroup::"
+
+          # Get IP
+          IP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          echo "ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "✅ Instance ready at: $IP"
+
+      # ── Wait for SSH ──
+      - name: Wait for SSH
+        run: |
+          IP="${{ steps.ec2.outputs.ip }}"
+          echo "Waiting for SSH on $IP (user: $SSH_USER)..."
+          for i in $(seq 1 36); do
+            if ssh $SSH_OPTS -i /tmp/ci-key.pem "$SSH_USER@$IP" "echo ssh-ready" 2>/dev/null; then
+              echo "✅ SSH ready after ~$((i * 5))s"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::SSH timeout after 3 minutes"
+          exit 1
+
+      # ── Upload code to remote ──
+      - name: Upload code to remote
+        if: inputs.upload-code
+        run: |
+          IP="${{ steps.ec2.outputs.ip }}"
+          echo "::group::Uploading code to $IP..."
+
+          # Create tarball (faster than git clone for large repos)
+          tar czf /tmp/repo.tar.gz -C "$GITHUB_WORKSPACE" .
+
+          scp $SSH_OPTS -i /tmp/ci-key.pem \
+            /tmp/repo.tar.gz "$SSH_USER@$IP":/tmp/repo.tar.gz
+
+          ssh $SSH_OPTS -i /tmp/ci-key.pem "$SSH_USER@$IP" \
+            "sudo mkdir -p /workspace && sudo chown $SSH_USER /workspace && tar xzf /tmp/repo.tar.gz -C /workspace"
+
+          echo "::endgroup::"
+          echo "✅ Code uploaded"
+
+      # ── Run tests ──
+      - name: ${{ inputs.job-name }}
+        run: |
+          IP="${{ steps.ec2.outputs.ip }}"
+
+          # Build the command: either inside Docker or directly
+          if [ -n "${{ inputs.docker-image }}" ]; then
+            REMOTE_CMD="docker run --rm ${{ inputs.docker-flags }} \
+              -v /workspace:/workspace -w /workspace \
+              ${{ inputs.docker-image }} \
+              bash -c '${{ inputs.test-script }}'"
+          else
+            REMOTE_CMD="cd /workspace && ${{ inputs.test-script }}"
+          fi
+
+          echo "::group::Running on remote (${{ inputs.instance-type }})..."
+          ssh $SSH_OPTS -i /tmp/ci-key.pem "$SSH_USER@$IP" bash <<REMOTE_SCRIPT
+            set -euxo pipefail
+            $REMOTE_CMD
+          REMOTE_SCRIPT
+          echo "::endgroup::"
+
+      # ── Collect results ──
+      - name: Collect results from remote
+        if: always() && inputs.artifacts-path != ''
+        run: |
+          IP="${{ steps.ec2.outputs.ip }}"
+          REMOTE_PATH="${{ inputs.artifacts-path }}"
+          mkdir -p /tmp/results
+          scp $SSH_OPTS -i /tmp/ci-key.pem -r \
+            "$SSH_USER@$IP":"$REMOTE_PATH" /tmp/results/ 2>/dev/null || \
+            echo "::warning::Could not collect artifacts from $REMOTE_PATH"
+
+      - name: Upload artifacts
+        if: always() && inputs.artifacts-name != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifacts-name }}
+          path: /tmp/results/
+          if-no-files-found: ignore
+
+      # ── Always terminate ──
+      - name: Terminate EC2 instance
+        if: always()
+        run: |
+          ID="${{ steps.ec2.outputs.instance-id }}"
+          if [ -n "$ID" ] && [ "$ID" != "None" ] && [ "$ID" != "" ]; then
+            aws ec2 terminate-instances --instance-ids "$ID" && \
+              echo "✅ Terminated $ID" || \
+              echo "::warning::Failed to terminate $ID"
+          fi
