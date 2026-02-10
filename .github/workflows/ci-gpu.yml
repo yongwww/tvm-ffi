@@ -83,10 +83,10 @@ jobs:
         git config --global --add safe.directory /home/jenkins/workspace
         cd /home/jenkins/workspace
 
-        # Build C++ tests
-        cmake . -B build -DTVM_FFI_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
-        cmake --build build --config Release --target tvm_ffi_tests -- -j$(nproc)
-        ctest -V -C Release --test-dir build --output-on-failure
+        # Build C++ tests (use separate dir so Python build can use 'build/')
+        cmake . -B build_cpp -DTVM_FFI_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+        cmake --build build_cpp --config Release --target tvm_ffi_tests -- -j$(nproc)
+        ctest -V -C Release --test-dir build_cpp --output-on-failure
 
         # Build and run Python tests
         pip3 install -e ".[test]" --break-system-packages 2>/dev/null || pip3 install -e ".[test]"
