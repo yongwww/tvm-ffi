@@ -126,10 +126,33 @@ jobs:
           role-duration-seconds: 3600
           role-skip-session-tagging: true
 
-      - name: Write SSH key
+      - name: Prepare SSH key and user-data
         run: |
           echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > /tmp/ci-key.pem
           chmod 600 /tmp/ci-key.pem
+
+          # Extract the public key from the private key
+          ssh-keygen -y -f /tmp/ci-key.pem > /tmp/ci-key.pub
+
+          # Create user-data script that injects our SSH public key
+          # (Jenkins AMI has a 'jenkins' user but only sets up SSH keys via
+          # the launch template user-data, which we don't use)
+          cat > /tmp/ec2-userdata.sh <<USERDATA
+          #!/bin/bash
+          # Set up SSH for the target user
+          USER_HOME=\$(eval echo ~$SSH_USER)
+          mkdir -p \$USER_HOME/.ssh
+          echo "$(cat /tmp/ci-key.pub)" >> \$USER_HOME/.ssh/authorized_keys
+          chmod 700 \$USER_HOME/.ssh
+          chmod 600 \$USER_HOME/.ssh/authorized_keys
+          chown -R $SSH_USER:\$(id -gn $SSH_USER 2>/dev/null || echo $SSH_USER) \$USER_HOME/.ssh
+          # Also allow ubuntu user as fallback
+          mkdir -p /home/ubuntu/.ssh
+          echo "$(cat /tmp/ci-key.pub)" >> /home/ubuntu/.ssh/authorized_keys
+          chmod 700 /home/ubuntu/.ssh
+          chmod 600 /home/ubuntu/.ssh/authorized_keys
+          chown -R ubuntu:ubuntu /home/ubuntu/.ssh 2>/dev/null || true
+          USERDATA
 
       # ── Add temporary SSH rule for this runner's IP ──
       - name: Allow SSH from this runner
@@ -176,6 +199,7 @@ jobs:
               --instance-type "${{ inputs.instance-type }}" \
               --key-name "$KEY_NAME" \
               --network-interfaces "$NET_IFACE" \
+              --user-data file:///tmp/ec2-userdata.sh \
               $MARKET_FLAG \
               --tag-specifications "ResourceType=instance,Tags=[
                 {Key=Name,Value=gha-${{ inputs.job-name }}-${{ github.run_id }}},
