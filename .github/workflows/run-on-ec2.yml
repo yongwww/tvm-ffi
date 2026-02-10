@@ -141,14 +141,18 @@ jobs:
           SG_IDS="${{ inputs.security-group-ids || vars.EC2_SG_IDS }}"
           KEY_NAME="${{ vars.EC2_KEY_NAME || 'gha-ci-key' }}"
 
+          # Build network interface JSON with public IP enabled
+          # (GHA hosted runner is on the internet, needs public IP to SSH in)
+          SG_JSON=$(echo "$SG_IDS" | tr ' ' '\n' | sed 's/.*/"&"/' | paste -sd, -)
+          NET_IFACE="[{\"AssociatePublicIpAddress\":true,\"DeviceIndex\":0,\"SubnetId\":\"$SUBNET\",\"Groups\":[$SG_JSON]}]"
+
           launch_instance() {
             local MARKET_FLAG="${1:-}"
             aws ec2 run-instances \
               --image-id "${{ inputs.ami }}" \
               --instance-type "${{ inputs.instance-type }}" \
               --key-name "$KEY_NAME" \
-              --security-group-ids $SG_IDS \
-              --subnet-id "$SUBNET" \
+              --network-interfaces "$NET_IFACE" \
               $MARKET_FLAG \
               --tag-specifications "ResourceType=instance,Tags=[
                 {Key=Name,Value=gha-${{ inputs.job-name }}-${{ github.run_id }}},
