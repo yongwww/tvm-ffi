@@ -44,6 +44,7 @@ jobs:
           aws-region: ${{ vars.EC2_AWS_REGION || 'us-west-2' }}
           role-to-assume: ${{ vars.AWS_ROLE_ARN || '' }}
           role-duration-seconds: 3600
+          role-skip-session-tagging: true
 
       - name: Find and terminate orphaned instances
         run: |

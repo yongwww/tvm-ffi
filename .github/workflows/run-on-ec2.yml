@@ -124,6 +124,7 @@ jobs:
           aws-region: ${{ inputs.aws-region }}
           role-to-assume: ${{ vars.AWS_ROLE_ARN || '' }}
           role-duration-seconds: 3600
+          role-skip-session-tagging: true
 
       - name: Write SSH key
         run: |
